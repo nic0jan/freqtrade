@@ -53,6 +53,15 @@ class TensorboardCallback(BaseCallback):
         for metric in local_info:
             if metric not in ["episode", "terminal_observation"]:
                 self.logger.record(f"info/{metric}", local_info[metric])
+                # Add comparison metrics when both total and current profit are available
+                if metric == "total_profit" and "current_profit_pct" in local_info:
+                    total = local_info["total_profit"]
+                    current = local_info["current_profit_pct"]
+                    # Absolute difference between realized (total) and unrealized (current) profit
+                    self.logger.record("info/profit_diff", total - current)
+                    # Ratio - protects against division by zero by logging zero if total is 0
+                    ratio = (current / total) if total else 0.0
+                    self.logger.record("info/profit_ratio", ratio)
 
         for category in tensorboard_metrics:
             for metric in tensorboard_metrics[category]:

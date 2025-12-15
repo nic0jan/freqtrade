@@ -78,6 +78,11 @@ class BaseEnvironment(gym.Env):
         self.config: dict = config
         self.rl_config: dict = config["freqai"]["rl_config"]
         self.add_state_info: bool = self.rl_config.get("add_state_info", False)
+        # Optional: include environment state (profit, position, trade_duration)
+        # in observations during training/backtesting as well.
+        self.include_env_state_in_observation: bool = self.rl_config.get(
+            "include_env_state_in_observation", False
+        )
         self.id: str = id
         self.max_drawdown: float = 1 - self.rl_config.get("max_training_drawdown_pct", 0.8)
         self.compound_trades: bool = config["stake_amount"] == "unlimited"
@@ -127,7 +132,7 @@ class BaseEnvironment(gym.Env):
         self.profit_aim: float = reward_kwargs["profit_aim"]
 
         # # spaces
-        if self.add_state_info:
+        if self.add_state_info or self.include_env_state_in_observation:
             self.total_features = self.signal_features.shape[1] + 3
         else:
             self.total_features = self.signal_features.shape[1]
@@ -146,6 +151,7 @@ class BaseEnvironment(gym.Env):
         self.total_reward: float = 0
         self._total_profit: float = 1
         self._total_unrealized_profit: float = 1
+        self._equity_peak: float = 1.0
         self.history: dict = {}
         self.trade_history: list = []
 
@@ -258,7 +264,7 @@ class BaseEnvironment(gym.Env):
         features_window = self.signal_features[
             (self._current_tick - self.window_size) : self._current_tick
         ]
-        if self.add_state_info:
+        if self.add_state_info or self.include_env_state_in_observation:
             features_and_state = DataFrame(
                 np.zeros((len(features_window), 3)),
                 columns=["current_profit_pct", "position", "trade_duration"],

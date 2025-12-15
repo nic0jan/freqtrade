@@ -136,7 +136,6 @@ class RPC:
             "strategy_version": strategy_version,
             "dry_run": config["dry_run"],
             "trading_mode": config.get("trading_mode", "spot"),
-            "margin_mode": config.get("margin_mode", ""),
             "short_allowed": config.get("trading_mode", "spot") != "spot",
             "stake_currency": config["stake_currency"],
             "stake_currency_decimals": decimals_per_coin(config["stake_currency"]),
@@ -1009,16 +1008,12 @@ class RPC:
                 return {"result": "Created exit orders for all open trades."}
 
             # Query for trade
-            trade = (
-                Trade.get_trades(
-                    trade_filter=[
-                        Trade.id == int(trade_id),
-                        Trade.is_open.is_(True),
-                    ]
-                ).first()
-                if trade_id.isdigit()
-                else None
-            )
+            trade = Trade.get_trades(
+                trade_filter=[
+                    Trade.id == trade_id,
+                    Trade.is_open.is_(True),
+                ]
+            ).first()
             if not trade:
                 logger.warning("force_exit: Invalid argument received")
                 raise RPCException("invalid argument")
@@ -1409,6 +1404,27 @@ class RPC:
         return {"log_count": len(records), "logs": records}
 
     @staticmethod
+    def _convert_numpy_types(obj: Any) -> Any:
+        """
+        Recursively convert numpy types to native Python types for JSON serialization.
+        This is needed because Pydantic cannot serialize numpy scalar types.
+        """
+        import numpy as np
+
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (list, tuple)):
+            return [RPC._convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: RPC._convert_numpy_types(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    @staticmethod
     def _convert_dataframe_to_dict(
         strategy: str,
         pair: str,
@@ -1451,6 +1467,10 @@ class RPC:
 
             dataframe = dataframe.replace({inf: None, -inf: None, nan: None})
 
+        # Convert dataframe to list and ensure all numpy types are converted to native Python types
+        data_list = dataframe.values.tolist()
+        data_list = RPC._convert_numpy_types(data_list)
+
         res = {
             "pair": pair,
             "timeframe": timeframe,
@@ -1458,7 +1478,7 @@ class RPC:
             "strategy": strategy,
             "all_columns": dataframe_columns,
             "columns": list(dataframe.columns),
-            "data": dataframe.values.tolist(),
+            "data": data_list,
             "length": len(dataframe),
             "buy_signals": signals["enter_long"],  # Deprecated
             "sell_signals": signals["exit_long"],  # Deprecated
@@ -1475,12 +1495,15 @@ class RPC:
             "annotations": annotations,
         }
         if has_content:
+            # Ensure timestamp values are converted to native Python int
+            data_start_ts = dataframe.iloc[0]["__date_ts"]
+            data_stop_ts = dataframe.iloc[-1]["__date_ts"]
             res.update(
                 {
                     "data_start": str(dataframe.iloc[0]["date"]),
-                    "data_start_ts": int(dataframe.iloc[0]["__date_ts"]),
+                    "data_start_ts": int(RPC._convert_numpy_types(data_start_ts)),
                     "data_stop": str(dataframe.iloc[-1]["date"]),
-                    "data_stop_ts": int(dataframe.iloc[-1]["__date_ts"]),
+                    "data_stop_ts": int(RPC._convert_numpy_types(data_stop_ts)),
                 }
             )
         return res
@@ -1561,76 +1584,69 @@ class RPC:
         selected_cols: list[str] | None,
         live: bool,
     ) -> dict[str, Any]:
-        """
-        Analyzed dataframe in Dict form, with full history loading and strategy analysis.
-        Loads the full history from disk or exchange, and runs the strategy analysis on it.
-        Should only be used in webserver mode, as it can interfere with a running bot.
-        """
         timerange_parsed = TimeRange.parse_timerange(config.get("timerange"))
 
         from freqtrade.data.converter import trim_dataframe
         from freqtrade.data.dataprovider import DataProvider
-        from freqtrade.persistence.usedb_context import FtNoDBContext
         from freqtrade.resolvers.strategy_resolver import StrategyResolver
 
-        with FtNoDBContext():
-            strategy_name = ""
-            startup_candles = 0
-            if config.get("strategy"):
-                strategy = StrategyResolver.load_strategy(config)
-                startup_candles = strategy.startup_candle_count
-                strategy_name = strategy.get_strategy_name()
+        strategy_name = ""
+        startup_candles = 0
+        if config.get("strategy"):
+            strategy = StrategyResolver.load_strategy(config)
+            startup_candles = strategy.startup_candle_count
+            strategy_name = strategy.get_strategy_name()
 
-            if live:
-                data = exchange.get_historic_ohlcv(
-                    pair=pair,
-                    timeframe=timeframe,
-                    since_ms=timerange_parsed.startts * 1000
-                    if timerange_parsed.startts
-                    else dt_ts(dt_now() - timedelta(days=30)),
-                    is_new_pair=True,  # history is never available - so always treat as new pair
-                    candle_type=config.get("candle_type_def", CandleType.SPOT),
-                    until_ms=timerange_parsed.stopts,
-                )
-            else:
-                _data = load_data(
-                    datadir=config["datadir"],
-                    pairs=[pair],
-                    timeframe=timeframe,
-                    timerange=timerange_parsed,
-                    data_format=config["dataformat_ohlcv"],
-                    candle_type=config.get("candle_type_def", CandleType.SPOT),
-                    startup_candles=startup_candles,
-                )
-                if pair not in _data:
-                    raise RPCException(
-                        f"No data for {pair}, {timeframe} in {config.get('timerange')} found."
-                    )
-                data = _data[pair]
-
-            annotations = []
-            if config.get("strategy"):
-                strategy.dp = DataProvider(config, exchange=exchange, pairlists=None)
-                strategy.ft_bot_start()
-
-                df_analyzed = strategy.analyze_ticker(data, {"pair": pair})
-                df_analyzed = trim_dataframe(
-                    df_analyzed, timerange_parsed, startup_candles=startup_candles
-                )
-                annotations = strategy.ft_plot_annotations(pair=pair, dataframe=df_analyzed)
-
-            else:
-                df_analyzed = data
-
-            return RPC._convert_dataframe_to_dict(
-                strategy_name,
-                pair,
-                timeframe,
-                df_analyzed.copy(),
-                dt_now(),
-                selected_cols,
-                annotations,
+        if live:
+            data = exchange.get_historic_ohlcv(
+                pair=pair,
+                timeframe=timeframe,
+                since_ms=timerange_parsed.startts * 1000
+                if timerange_parsed.startts
+                else dt_ts(dt_now() - timedelta(days=30)),
+                is_new_pair=True,  # history is never available - so always treat as new pair
+                candle_type=config.get("candle_type_def", CandleType.SPOT),
+                until_ms=timerange_parsed.stopts,
             )
+        else:
+            _data = load_data(
+                datadir=config["datadir"],
+                pairs=[pair],
+                timeframe=timeframe,
+                timerange=timerange_parsed,
+                data_format=config["dataformat_ohlcv"],
+                candle_type=config.get("candle_type_def", CandleType.SPOT),
+                startup_candles=startup_candles,
+            )
+            if pair not in _data:
+                raise RPCException(
+                    f"No data for {pair}, {timeframe} in {config.get('timerange')} found."
+                )
+            data = _data[pair]
+
+        annotations = []
+        if config.get("strategy"):
+            strategy.dp = DataProvider(config, exchange=exchange, pairlists=None)
+            strategy.ft_bot_start()
+
+            df_analyzed = strategy.analyze_ticker(data, {"pair": pair})
+            df_analyzed = trim_dataframe(
+                df_analyzed, timerange_parsed, startup_candles=startup_candles
+            )
+            annotations = strategy.ft_plot_annotations(pair=pair, dataframe=df_analyzed)
+
+        else:
+            df_analyzed = data
+
+        return RPC._convert_dataframe_to_dict(
+            strategy_name,
+            pair,
+            timeframe,
+            df_analyzed.copy(),
+            dt_now(),
+            selected_cols,
+            annotations,
+        )
 
     def _rpc_plot_config(self) -> dict[str, Any]:
         if (

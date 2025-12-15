@@ -1,36 +1,71 @@
 ---
 services:
   freqtrade:
-    image: freqtradeorg/freqtrade:stable
-    # image: freqtradeorg/freqtrade:develop
-    # Use plotting image
-    # image: freqtradeorg/freqtrade:develop_plot
-    # # Enable GPU Image and GPU Resources (only relevant for freqAI)
-    # # Make sure to uncomment the whole deploy section
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    # Build step - only needed when additional dependencies are needed
-    # build:
-    #   context: .
-    #   dockerfile: "./docker/Dockerfile.custom"
+    image: freqtradeorg/freqtrade:stable_freqairl
+    # Enable GPU Image and GPU Resources
+    deploy:
+      resources:
+        limits:
+          memory: 64G  # Use 75% of WSL2 memory (64GB) for container
+          cpus: '32.0'  # Use 75% of WSL2 CPUs (32) for container
+        reservations:
+          memory: 48G   # Reserve significant memory for stable operation
+          cpus: '16.0'  # Reserve significant CPU for stable operation
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
     restart: unless-stopped
-    container_name: freqtrade
+    container_name: freqtrade-gpu-rl
+    # Add health check to detect issues before container dies
+    healthcheck:
+      test: ["CMD", "sh", "-c", "free -m | awk 'NR==2{printf \"%.0f\", $3*100/$2}' && curl -f -u freqtrader:euro http://localhost:8080/api/v1/status"]
+      interval: 60s
+      timeout: 30s
+      retries: 2
+      start_period: 120s
     volumes:
       - "./user_data:/freqtrade/user_data"
+      - "./user_data/configrl0.json:/freqtrade/user_data/config.json"
+      - "/etc/localtime:/etc/localtime:ro"
+      - "/etc/timezone:/etc/timezone:ro"
     # Expose api on port 8080 (localhost only)
     # Please read the https://www.freqtrade.io/en/stable/rest-api/ documentation
     # for more information.
     ports:
       - "127.0.0.1:8080:8080"
+      - "127.0.0.1:6006:6007"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     # Default command used when running `docker compose up`
     command: >
       trade
       --logfile /freqtrade/user_data/logs/freqtrade.log
       --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
       --config /freqtrade/user_data/config.json
-      --strategy SampleStrategy
+      --freqaimodel CustomReinforcementLearner
+      --strategy OptimalRLStrategy
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
+      - TZ=UTC
+      # Add memory management environment variables
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      # Limit Python memory usage
+      - PYTHONMALLOC=malloc
+      - MALLOC_TRIM_THRESHOLD_=131072
+      # WSL2 specific optimizations - Maximum allocation
+      - WSL2_MEMORY_LIMIT=64GB
+      - WSL2_CPU_LIMIT=32
+      # RL training optimizations
+      - OMP_NUM_THREADS=24
+      - MKL_NUM_THREADS=24
+      - NUMEXPR_NUM_THREADS=24
+      # Background trade fetching optimizations
+      - BACKGROUND_TRADE_FETCHING=true
+      - TRADE_DATA_FETCH_INTERVAL=30
+      - TRADE_DATA_QUEUE_SIZE=100

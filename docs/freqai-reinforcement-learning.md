@@ -28,6 +28,41 @@ As explained above, the agent is "trained" in an artificial trading "environment
 
 ## Running Reinforcement Learning
 
+### Optional RL feature toggles
+
+You can enable a small set of additional signals and shaping terms without changing your strategy code.
+These are off by default to preserve backward compatibility.
+
+Config snippet:
+
+```json
+"freqai": {
+  "rl_config": {
+    "include_env_state_in_observation": true,
+    "model_reward_parameters": {
+      "drawdown_penalty_lambda": 0.1,
+      "win_reward_factor": 2
+    }
+  },
+  "rl_features": {
+    "volatility_regime": true
+  }
+}
+```
+
+When enabled:
+- include_env_state_in_observation: appends three environment state channels to the observation during training/backtesting and live: current_profit_pct, position, trade_duration. This mirrors the live-only `add_state_info` behaviour but is safe to use in training.
+- rl_features.volatility_regime: adds generic volatility/regime features to the feature set:
+  - %-atr_norm_14, %-atr_norm_30 (ATR-like normalized by price)
+  - %-parkinson_30 (Parkinson volatility, 30-period)
+  - %-regime_label (-1 range to +1 trend via EMA slope vs ATR)
+  - %-session_asia, %-session_eu, %-session_us (UTC buckets)
+- model_reward_parameters.drawdown_penalty_lambda: adds a small per-step penalty proportional to current drawdown relative to the peak equity observed during the episode.
+
+Notes:
+- These features are computed from base OHLCV only and do not require external data.
+- If you use your own custom environment, you can replicate or extend these signals in your subclass.
+
 Setting up and running a Reinforcement Learning model is the same as running a Regressor or Classifier. The same two flags, `--freqaimodel` and `--strategy`, must be defined on the command line:
 
 ```bash

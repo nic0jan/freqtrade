@@ -73,7 +73,6 @@ from freqtrade.exchange.exchange_types import (
     CcxtOrder,
     CcxtPosition,
     FtHas,
-    FundingRate,
     OHLCVResponse,
     OrderBook,
     Ticker,
@@ -138,7 +137,6 @@ class Exchange:
         "ohlcv_has_history": True,  # Some exchanges (Kraken) don't provide history via ohlcv
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
-        "download_data_parallel_quick": True,
         "always_require_api_keys": False,  # purge API keys for Dry-run. Must default to false.
         # Check https://github.com/ccxt/ccxt/issues/10767 for removal of ohlcv_volume_currency
         "ohlcv_volume_currency": "base",  # "base" or "quote"
@@ -166,7 +164,6 @@ class Exchange:
         "proxy_coin_mapping": {},  # Mapping for proxy coins
         # Expected to be in the format {"fetchOHLCV": True} or {"fetchOHLCV": False}
         "ws_enabled": False,  # Set to true for exchanges with tested websocket support
-        "has_delisting": False,  # Set to true for exchanges that have delisting pair checks
     }
     _ft_has: FtHas = {}
     _ft_has_futures: FtHas = {}
@@ -199,6 +196,9 @@ class Exchange:
         # Lock event loop. This is necessary to avoid race-conditions when using force* commands
         # Due to funding fee fetching.
         self._loop_lock = Lock()
+        self._processing_lock = Lock()
+        self._exit_lock = Lock()
+        self._trade_fetch_lock = Lock()
         self.loop = self._init_async_loop()
         self._config: Config = {}
 
@@ -300,7 +300,7 @@ class Exchange:
 
         if self.trading_mode != TradingMode.SPOT and load_leverage_tiers:
             self.fill_leverage_tiers()
-        self.ft_additional_exchange_init()
+        self.additional_exchange_init()
 
     def __del__(self):
         """
@@ -454,12 +454,6 @@ class Exchange:
         Might need to be updated if https://github.com/ccxt/ccxt/issues/20408 is fixed.
         """
         return self._api.precisionMode
-
-    def ft_additional_exchange_init(self) -> None:
-        """
-        Wrapper around additional_exchange_init to simplify testing
-        """
-        self.additional_exchange_init()
 
     def additional_exchange_init(self) -> None:
         """
@@ -699,13 +693,12 @@ class Exchange:
             # Reload async markets, then assign them to sync api
             retrier(self._load_async_markets, retries=retries)(reload=True)
             self._markets = self._api_async.markets
-            self._api.set_markets_from_exchange(self._api_async)
+            self._api.set_markets(self._api_async.markets, self._api_async.currencies)
             # Assign options array, as it contains some temporary information from the exchange.
-            # TODO: investigate with ccxt if it's safe to remove `.options`
             self._api.options = self._api_async.options
             if self._exchange_ws:
                 # Set markets to avoid reloading on websocket api
-                self._ws_async.set_markets_from_exchange(self._api_async)
+                self._ws_async.set_markets(self._api.markets, self._api.currencies)
                 self._ws_async.options = self._api.options
             self._last_markets_refresh = dt_ts()
 
@@ -838,15 +831,9 @@ class Exchange:
 
     def validate_freqai(self, config: Config) -> None:
         freqai_enabled = config.get("freqai", {}).get("enabled", False)
-        override = config.get("freqai", {}).get("override_exchange_checks", False)
-        if not override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
+        if freqai_enabled and not self._ft_has["ohlcv_has_history"]:
             raise ConfigurationError(
                 f"Historic OHLCV data not available for {self.name}. Can't use freqAI."
-            )
-        elif override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
-            logger.warning(
-                "Overriding exchange checks for freqAI. Make sure that your exchange supports "
-                "fetching historic OHLCV data, otherwise freqAI will not work."
             )
 
     def validate_required_startup_candles(self, startup_candles: int, timeframe: str) -> int:
@@ -891,7 +878,6 @@ class Exchange:
         self,
         trading_mode: TradingMode,
         margin_mode: MarginMode | None,  # Only None when trading_mode = TradingMode.SPOT
-        allow_none_margin_mode: bool = False,
     ):
         """
         Checks if freqtrade can perform trades using the configured
@@ -899,37 +885,13 @@ class Exchange:
         Throws OperationalException:
             If the trading_mode/margin_mode type are not supported by freqtrade on this exchange
         """
-        if trading_mode == TradingMode.SPOT:
-            return
-        if allow_none_margin_mode and margin_mode is None:
-            # Verify trading mode independent of margin mode
-            if not any(
-                trading_mode == pair[0] for pair in self._supported_trading_mode_margin_pairs
-            ):
-                raise ConfigurationError(
-                    f"Freqtrade does not support '{trading_mode}' on {self.name}."
-                )
-
-        if not allow_none_margin_mode and (
+        if trading_mode != TradingMode.SPOT and (
             (trading_mode, margin_mode) not in self._supported_trading_mode_margin_pairs
         ):
             mm_value = margin_mode and margin_mode.value
             raise ConfigurationError(
                 f"Freqtrade does not support '{mm_value}' '{trading_mode}' on {self.name}."
             )
-
-    @classmethod
-    def combine_ft_has(cls, include_futures: bool) -> FtHas:
-        """
-        Combine all ft_has options from the class hierarchy.
-        Child classes override parent classes.
-        Doesn't apply overrides from the configuration.
-        """
-        _ft_has = deep_merge_dicts(cls._ft_has, deepcopy(cls._ft_has_default))
-
-        if include_futures:
-            _ft_has = deep_merge_dicts(cls._ft_has_futures, _ft_has)
-        return _ft_has
 
     def build_ft_has(self, exchange_conf: ExchangeConfig) -> None:
         """
@@ -938,8 +900,9 @@ class Exchange:
         This is called on initialization of the exchange object.
         It must be called before ft_has is used.
         """
-        self._ft_has = self.combine_ft_has(include_futures=self.trading_mode == TradingMode.FUTURES)
-
+        self._ft_has = deep_merge_dicts(self._ft_has, deepcopy(self._ft_has_default))
+        if self.trading_mode == TradingMode.FUTURES:
+            self._ft_has = deep_merge_dicts(self._ft_has_futures, self._ft_has)
         if exchange_conf.get("_ft_has_params"):
             self._ft_has = deep_merge_dicts(exchange_conf.get("_ft_has_params"), self._ft_has)
             logger.info("Overriding exchange._ft_has with config params, result: %s", self._ft_has)
@@ -2041,30 +2004,6 @@ class Exchange:
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
 
-    @retrier
-    def fetch_funding_rate(self, pair: str) -> FundingRate:
-        """
-        Get current Funding rate from exchange.
-        On Futures markets, this is the interest rate for holding a position.
-        Won't work for non-futures markets
-        """
-        try:
-            if pair not in self.markets or self.markets[pair].get("active", False) is False:
-                raise ExchangeError(f"Pair {pair} not available")
-            return self._api.fetch_funding_rate(pair)
-        except ccxt.NotSupported as e:
-            raise OperationalException(
-                f"Exchange {self._api.name} does not support fetching funding rate. Message: {e}"
-            ) from e
-        except ccxt.DDoSProtection as e:
-            raise DDosProtection(e) from e
-        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
-            raise TemporaryError(
-                f"Could not get funding rate due to {e.__class__.__name__}. Message: {e}"
-            ) from e
-        except ccxt.BaseError as e:
-            raise OperationalException(e) from e
-
     @staticmethod
     def get_next_limit_in_list(
         limit: int,
@@ -2520,14 +2459,7 @@ class Exchange:
                         data.extend(new_data)
         # Sort data again after extending the result - above calls return in "async order"
         data = sorted(data, key=lambda x: x[0])
-        return (
-            pair,
-            timeframe,
-            candle_type,
-            data,
-            # funding_rates are always complete, so never need to be dropped.
-            self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
-        )
+        return pair, timeframe, candle_type, data, self._ohlcv_partial_candle
 
     def _try_build_from_websocket(
         self, pair: str, timeframe: str, candle_type: CandleType
@@ -2637,24 +2569,14 @@ class Exchange:
         input_coroutines: list[Coroutine[Any, Any, OHLCVResponse]] = []
         cached_pairs = []
         for pair, timeframe, candle_type in set(pair_list):
-            invalid_funding = (
-                candle_type == CandleType.FUNDING_RATE
-                and timeframe != self.get_option("funding_fee_timeframe")
-            )
-            invalid_timeframe = timeframe not in self.timeframes and candle_type in (
+            if timeframe not in self.timeframes and candle_type in (
                 CandleType.SPOT,
                 CandleType.FUTURES,
-            )
-            if invalid_timeframe or invalid_funding:
-                timeframes_ = (
-                    ", ".join(self.timeframes)
-                    if candle_type != CandleType.FUNDING_RATE
-                    else self.get_option("funding_fee_timeframe")
-                )
+            ):
                 logger.warning(
-                    f"Cannot download ({pair}, {timeframe}, {candle_type}) combination as this "
-                    f"timeframe is not available on {self.name}. Available timeframes are "
-                    f"{timeframes_}."
+                    f"Cannot download ({pair}, {timeframe}) combination as this timeframe is "
+                    f"not available on {self.name}. Available timeframes are "
+                    f"{', '.join(self.timeframes)}."
                 )
                 continue
 
@@ -2837,7 +2759,7 @@ class Exchange:
                 timeframe, candle_type=candle_type, since_ms=since_ms
             )
 
-            if candle_type and candle_type not in (CandleType.SPOT, CandleType.FUTURES):
+            if candle_type and candle_type != CandleType.SPOT:
                 params.update({"price": candle_type.value})
             if candle_type != CandleType.FUNDING_RATE:
                 data = await self._api_async.fetch_ohlcv(
@@ -2852,6 +2774,8 @@ class Exchange:
                     since_ms=since_ms,
                 )
             # Some exchanges sort OHLCV in ASC order and others in DESC.
+            # Ex: Bittrex returns the list of OHLCV in ASC order (oldest first, newest last)
+            # while GDAX returns the list of OHLCV in DESC order (newest first, oldest last)
             # Only sort if necessary to save computing time
             try:
                 if data and data[0][0] > data[-1][0]:
@@ -2860,14 +2784,7 @@ class Exchange:
                 logger.exception("Error loading %s. Result was %s.", pair, data)
                 return pair, timeframe, candle_type, [], self._ohlcv_partial_candle
             logger.debug("Done fetching pair %s, %s interval %s...", pair, candle_type, timeframe)
-            return (
-                pair,
-                timeframe,
-                candle_type,
-                data,
-                # funding_rates are always complete, so never need to be dropped.
-                self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
-            )
+            return pair, timeframe, candle_type, data, self._ohlcv_partial_candle
 
         except ccxt.NotSupported as e:
             raise OperationalException(
@@ -3315,7 +3232,7 @@ class Exchange:
             for sig in [signal.SIGINT, signal.SIGTERM]:
                 try:
                     self.loop.add_signal_handler(sig, task.cancel)
-                except (NotImplementedError, RuntimeError):
+                except NotImplementedError:
                     # Not all platforms implement signals (e.g. windows)
                     pass
             return self.loop.run_until_complete(task)
@@ -3897,10 +3814,7 @@ class Exchange:
         """
 
         market = self.markets[pair]
-        # default to some default fee if not available from exchange
-        taker_fee_rate = market["taker"] or self._api.describe().get("fees", {}).get(
-            "trading", {}
-        ).get("taker", 0.001)
+        taker_fee_rate = market["taker"]
         mm_ratio, _ = self.get_maintenance_ratio_and_amt(pair, stake_amount)
 
         if self.trading_mode == TradingMode.FUTURES and self.margin_mode == MarginMode.ISOLATED:
@@ -3953,13 +3867,45 @@ class Exchange:
         else:
             raise ExchangeError(f"Cannot get maintenance ratio using {self.name}")
 
-    def check_delisting_time(self, pair: str) -> datetime | None:
+    async def _async_refresh_trades(
+        self, pairs: ListPairsWithTimeframes
+    ) -> dict[PairWithTimeframe, DataFrame]:
         """
-        Check if the pair gonna be delisted.
-        This function should be overridden by the exchange class if the exchange
-        provides such information.
-        By default, it returns None.
-        :param pair: Market symbol
-        :return: Datetime if the pair gonna be delisted, None otherwise
+        Asynchronous version of refresh_latest_trades for background processing
         """
-        return None
+        async with self._trade_fetch_lock:
+            try:
+                logger.debug(f"Async refreshing trades for {len(pairs)} pairs")
+
+                # Use the existing async trade fetching logic
+                results_df = {}
+                trades_dl_jobs = []
+
+                from freqtrade.data.history import get_datahandler
+
+                data_handler = get_datahandler(
+                    self._config["datadir"], data_format=self._config["dataformat_trades"]
+                )
+
+                for pair_wt in set(pairs):
+                    trades_dl_jobs.append(
+                        self._build_trades_dl_jobs(pair_wt, data_handler, True)
+                    )
+
+                # Execute all trade fetching jobs concurrently
+                if trades_dl_jobs:
+                    results = await asyncio.gather(*trades_dl_jobs, return_exceptions=True)
+
+                    for res in results:
+                        if isinstance(res, Exception):
+                            logger.warning(f"Async trade fetch raised exception: {repr(res)}")
+                            continue
+                        pairwt, trades_df = res
+                        if trades_df is not None:
+                            results_df[pairwt] = trades_df
+
+                return results_df
+
+            except Exception as e:
+                logger.error(f"Error in async trade refresh: {e}")
+                return {}

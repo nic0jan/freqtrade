@@ -23,11 +23,12 @@ from freqtrade.data.history import get_datahandler, load_pair_history
 from freqtrade.enums import CandleType, RPCMessageType, RunMode, TradingMode
 from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.exchange import Exchange, timeframe_to_prev_date, timeframe_to_seconds
-from freqtrade.exchange.exchange_types import FundingRate, OrderBook
+from freqtrade.exchange.exchange_types import OrderBook
 from freqtrade.misc import append_candles_to_dataframe
 from freqtrade.rpc import RPCManager
 from freqtrade.rpc.rpc_types import RPCAnalyzedDFMsg
 from freqtrade.util import PeriodicCache
+from freqtrade.data.background_trade_fetcher import BackgroundTradeFetcher
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,11 @@ class DataProvider:
         self.__slice_index: dict[str, int] = {}
         self.__slice_date: datetime | None = None
 
+        self._background_fetcher: BackgroundTradeFetcher | None = None
+        if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+            if exchange:
+                self._background_fetcher = BackgroundTradeFetcher(exchange, config)
+
         self.__cached_pairs_backtesting: dict[PairWithTimeframe, DataFrame] = {}
         self.__producer_pairs_df: dict[
             str, dict[PairWithTimeframe, tuple[DataFrame, datetime]]
@@ -68,6 +74,14 @@ class DataProvider:
 
         self.producers = self._config.get("external_message_consumer", {}).get("producers", [])
         self.external_data_enabled = len(self.producers) > 0
+
+    def start(self):
+        if self._background_fetcher:
+            self._background_fetcher.start()
+
+    def stop(self):
+        if self._background_fetcher:
+            self._background_fetcher.stop()
 
     def _set_dataframe_max_index(self, pair: str, limit_index: int):
         """
@@ -433,6 +447,57 @@ class DataProvider:
         # self.__cached_pairs_backtesting = {}
         self.__slice_index = {}
 
+    def _cleanup_old_data(self):
+        """Clean up old cached data to prevent memory buildup"""
+        try:
+            max_cache_size = self._config.get("internals", {}).get("max_cache_size_mb", 500) * (
+                1024**2
+            )
+            current_cache_size = sum(
+                df.memory_usage(deep=True).sum() for df, _ in self.__cached_pairs.values()
+            )
+
+            if current_cache_size > max_cache_size:
+                logger.info(
+                    f"Cache size {current_cache_size / (1024**2):.1f}MB exceeds limit "
+                    f"{max_cache_size / (1024**2):.1f}MB, cleaning up..."
+                )
+
+                # Remove oldest cached data
+                sorted_pairs = sorted(
+                    self.__cached_pairs.items(),
+                    key=lambda x: x[1][1],  # Sort by timestamp
+                )
+
+                # Keep only the most recent data
+                while current_cache_size > max_cache_size * 0.8 and len(sorted_pairs) > 1:
+                    pair, (df, timestamp) = sorted_pairs.pop(0)
+                    memory_freed = df.memory_usage(deep=True).sum()
+                    del self.__cached_pairs[pair]
+                    current_cache_size -= memory_freed
+                    logger.debug(f"Freed {memory_freed / (1024**2):.1f}MB from {pair}")
+
+        except Exception as e:
+            logger.warning(f"Error during automatic data cleanup: {e}")
+
+    def get_cache_stats(self) -> dict:
+        """Get cache statistics for monitoring"""
+        try:
+            total_memory = sum(
+                df.memory_usage(deep=True).sum() for df, _ in self.__cached_pairs.values()
+            )
+
+            return {
+                "cached_pairs": len(self.__cached_pairs),
+                "total_memory_mb": total_memory / (1024**2),
+                "max_cache_size_mb": self._config.get("internals", {}).get(
+                    "max_cache_size_mb", 500
+                ),
+            }
+        except Exception as e:
+            logger.warning(f"Error getting cache stats: {e}")
+            return {"error": str(e)}
+
     # Exchange functions
 
     def refresh(
@@ -448,8 +513,8 @@ class DataProvider:
         final_pairs = (pairlist + helping_pairs) if helping_pairs else pairlist
         # refresh latest ohlcv data
         self._exchange.refresh_latest_ohlcv(final_pairs)
-        # refresh latest trades data
-        self.refresh_latest_trades(pairlist)
+        # refresh latest trades data, which is handled by the background fetcher
+        # self.refresh_latest_trades(pairlist)
 
     def refresh_latest_trades(self, pairlist: ListPairsWithTimeframes) -> None:
         """
@@ -498,12 +563,7 @@ class DataProvider:
             return DataFrame()
 
     def trades(
-        self,
-        pair: str,
-        timeframe: str | None = None,
-        copy: bool = True,
-        candle_type: str = "",
-        timerange: TimeRange | None = None,
+        self, pair: str, timeframe: str | None = None, copy: bool = True, candle_type: str = ""
     ) -> DataFrame:
         """
         Get candle (TRADES) data for the given pair as DataFrame
@@ -531,7 +591,7 @@ class DataProvider:
                 self._config["datadir"], data_format=self._config["dataformat_trades"]
             )
             trades_df = data_handler.trades_load(
-                pair, self._config.get("trading_mode", TradingMode.SPOT), timerange=timerange
+                pair, self._config.get("trading_mode", TradingMode.SPOT)
             )
             return trades_df
 
@@ -548,7 +608,6 @@ class DataProvider:
     def ticker(self, pair: str):
         """
         Return last ticker data from exchange
-        Warning: Performs a network request - so use with common sense.
         :param pair: Pair to get the data for
         :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
         """
@@ -562,7 +621,7 @@ class DataProvider:
     def orderbook(self, pair: str, maximum: int) -> OrderBook:
         """
         Fetch latest l2 orderbook data
-        Warning: Performs a network request - so use with common sense.
+        Warning: Does a network request - so use with common sense.
         :param pair: pair to get the data for
         :param maximum: Maximum number of orderbook entries to query
         :return: dict including bids/asks with a total of `maximum` entries.
@@ -570,23 +629,6 @@ class DataProvider:
         if self._exchange is None:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)
         return self._exchange.fetch_l2_order_book(pair, maximum)
-
-    def funding_rate(self, pair: str) -> FundingRate:
-        """
-        Return Funding rate from the exchange
-        Warning: Performs a network request - so use with common sense.
-        :param pair: Pair to get the data for
-        :return: Funding rate dict from exchange or empty dict if funding rate is not available
-            If available, the "fundingRate" field will contain the funding rate.
-            "fundingTimestamp" and "fundingDatetime" will contain the next funding times.
-            Actually filled fields may vary between exchanges.
-        """
-        if self._exchange is None:
-            raise OperationalException(NO_EXCHANGE_EXCEPTION)
-        try:
-            return self._exchange.fetch_funding_rate(pair)
-        except ExchangeError:
-            return {}
 
     def send_msg(self, message: str, *, always_send: bool = False) -> None:
         """
@@ -604,19 +646,3 @@ class DataProvider:
         if always_send or message not in self.__msg_cache:
             self._msg_queue.append(message)
         self.__msg_cache[message] = True
-
-    def check_delisting(self, pair: str) -> datetime | None:
-        """
-        Check if a pair gonna be delisted on the exchange.
-        Will only return datetime if the pair is gonna be delisted.
-        :param pair: Pair to check
-        :return: Datetime of the pair's delisting, None otherwise
-        """
-        if self._exchange is None:
-            raise OperationalException(NO_EXCHANGE_EXCEPTION)
-
-        try:
-            return self._exchange.check_delisting_time(pair)
-        except ExchangeError:
-            logger.warning(f"Could not fetch market data for {pair}. Assuming no delisting.")
-            return None

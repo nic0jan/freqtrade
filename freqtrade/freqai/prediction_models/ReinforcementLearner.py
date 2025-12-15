@@ -124,22 +124,37 @@ class ReinforcementLearner(BaseReinforcementLearningModel):
             float = the reward to give to the agent for current step (used for optimization
                 of weights in NN)
             """
+            # helper: dynamic drawdown penalty
+            def _dd_penalty() -> float:
+                lam = self.rl_config.get("model_reward_parameters", {}).get(
+                    "drawdown_penalty_lambda", 0.0
+                )
+                if lam <= 0:
+                    return 0.0
+                # estimate current equity and update peak
+                eq_now = max(float(self._total_profit), float(self._total_unrealized_profit))
+                if not hasattr(self, "_equity_peak"):
+                    self._equity_peak = 1.0
+                self._equity_peak = max(self._equity_peak, eq_now)
+                dd = 0.0 if self._equity_peak <= 0 else max(0.0, (self._equity_peak - eq_now) / self._equity_peak)
+                return -float(lam) * float(dd)
+
             # first, penalize if the action is not valid
             if not self._is_valid(action):
                 self.tensorboard_log("invalid", category="actions")
-                return -2
+                return -2 + _dd_penalty()
 
             pnl = self.get_unrealized_profit()
             factor = 100.0
 
             # reward agent for entering trades
             if action == Actions.Long_enter.value and self._position == Positions.Neutral:
-                return 25
+                return 25 + _dd_penalty()
             if action == Actions.Short_enter.value and self._position == Positions.Neutral:
-                return 25
+                return 25 + _dd_penalty()
             # discourage agent from not entering trades
             if action == Actions.Neutral.value and self._position == Positions.Neutral:
-                return -1
+                return -1 + _dd_penalty()
 
             max_trade_duration = self.rl_config.get("max_trade_duration_candles", 300)
             trade_duration = self._current_tick - self._last_trade_tick  # type: ignore
@@ -154,18 +169,18 @@ class ReinforcementLearner(BaseReinforcementLearningModel):
                 self._position in (Positions.Short, Positions.Long)
                 and action == Actions.Neutral.value
             ):
-                return -1 * trade_duration / max_trade_duration
+                return (-1 * trade_duration / max_trade_duration) + _dd_penalty()
 
             # close long
             if action == Actions.Long_exit.value and self._position == Positions.Long:
                 if pnl > self.profit_aim * self.rr:
                     factor *= self.rl_config["model_reward_parameters"].get("win_reward_factor", 2)
-                return float(pnl * factor)
+                return float(pnl * factor) + _dd_penalty()
 
             # close short
             if action == Actions.Short_exit.value and self._position == Positions.Short:
                 if pnl > self.profit_aim * self.rr:
                     factor *= self.rl_config["model_reward_parameters"].get("win_reward_factor", 2)
-                return float(pnl * factor)
+                return float(pnl * factor) + _dd_penalty()
 
-            return 0.0
+            return 0.0 + _dd_penalty()

@@ -845,6 +845,51 @@ class FreqaiDataKitchen:
         )
         metadata = {"pair": pair}
         dataframe = strategy.feature_engineering_standard(dataframe.copy(), metadata=metadata)
+        # Add optional RL volatility/regime features (kept minimal and generic)
+        # Config gate: config["freqai"]["rl_features"]["volatility_regime"] = True
+        try:
+            rl_features_cfg = self.freqai_config.get("rl_features", {})
+            if rl_features_cfg.get("volatility_regime", False):
+                # Base OHLC on the main timeframe
+                if all(c in dataframe.columns for c in ["open", "high", "low", "close", "date"]):
+                    dfv = dataframe[["date", "open", "high", "low", "close"]].copy()
+                    # True range components
+                    prev_close = dfv["close"].shift(1)
+                    hl = (dfv["high"] - dfv["low"]).abs()
+                    hc = (dfv["high"] - prev_close).abs()
+                    lc = (dfv["low"] - prev_close).abs()
+                    tr = hl.combine(hc, max).combine(lc, max)
+                    # ATR-like normalized by price
+                    atr14 = tr.rolling(14, min_periods=14).mean() / dfv["close"]
+                    atr30 = tr.rolling(30, min_periods=30).mean() / dfv["close"]
+                    dataframe["%-atr_norm_14"] = atr14.fillna(0.0)
+                    dataframe["%-atr_norm_30"] = atr30.fillna(0.0)
+                    # Parkinson volatility (windowed)
+                    # sigma_P^2 = (1/(4*ln2)) * (ln(H/L))^2
+                    # Use rolling mean of sigma^2, take sqrt for sigma
+                    with pd.option_context("mode.use_inf_as_na", True):
+                        log_hl = (dfv["high"] / dfv["low"]).apply(lambda x: np.log(x) if x > 0 else 0)
+                    parkinson_var = (log_hl ** 2) / (4.0 * np.log(2.0))
+                    parkinson30 = parkinson_var.rolling(30, min_periods=30).mean().apply(
+                        lambda x: np.sqrt(x) if pd.notna(x) and x >= 0 else 0
+                    )
+                    dataframe["%-parkinson_30"] = parkinson30.fillna(0.0)
+                    # Simple regime label via EMA slope vs ATR
+                    ema50 = dfv["close"].ewm(span=50, adjust=False).mean()
+                    ema_slope = ema50.diff()
+                    # Threshold relative to ATR to separate range vs trend
+                    thresh = (atr30 * dfv["close"]).fillna(0.0) * 0.10
+                    regime = np.where(ema_slope > thresh, 1, np.where(ema_slope < -thresh, -1, 0))
+                    dataframe["%-regime_label"] = regime.astype(float)
+                    # Session flags (rough UTC buckets)
+                    # Asia: 0-7, Europe: 8-15, US: 16-23
+                    hours = pd.to_datetime(dfv["date"], utc=True).dt.hour
+                    dataframe["%-session_asia"] = ((hours >= 0) & (hours <= 7)).astype(float)
+                    dataframe["%-session_eu"] = ((hours >= 8) & (hours <= 15)).astype(float)
+                    dataframe["%-session_us"] = ((hours >= 16) & (hours <= 23)).astype(float)
+        except Exception as _e:
+            # Keep feature addition best-effort and non-fatal
+            logger.exception("Failed to compute RL volatility/regime features.", exc_info=True)
         # ensure corr pairs are always last
         for corr_pair in corr_pairs:
             if pair == corr_pair:

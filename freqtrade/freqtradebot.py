@@ -1,5 +1,5 @@
 """
-Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
+Freqtrade is the main module of this bot. It contains the class Freqtrade()
 """
 
 import logging
@@ -226,11 +226,20 @@ class FreqtradeBot(LoggingMixin):
 
     def startup(self) -> None:
         """
-        Called on startup and after reloading the bot - triggers notifications and
-        performs startup tasks
+        Called on startup and after config reload
         """
-        migrate_binance_futures_names(self.config)
-        set_startup_time()
+        self.rpc.send_msg(
+            {"type": RPCMessageType.STATUS_NOTIFICATION, "status": f"executing startup"}
+        )
+        if self.trading_mode == TradingMode.FUTURES:
+            self.exchange.validate_leverage_tiers()
+        self.strategy.strategy_init(self.config)
+
+        self.dataprovider.start()
+
+        self.active_pair_whitelist = self.pairlists.whitelist.copy()
+        # Set first state based on configuration
+        self.state = State.RUNNING
 
         self.rpc.startup_messages(self.config, self.pairlists, self.protections)
         # Update older trades with precision and precision mode
@@ -243,6 +252,15 @@ class FreqtradeBot(LoggingMixin):
         self.startup_update_open_orders()
         self.update_all_liquidation_prices()
         self.update_funding_fees()
+
+        self._strategy.strategy_exit()
+        self.rpc.cleanup()
+        self.wallets.cleanup()
+        self.dataprovider.stop()
+        if self.last_process:
+            logger.info(
+                f"Bot finished in {time.time() - self.last_process.timestamp():.2f} seconds."
+            )
 
     def process(self) -> None:
         """
@@ -1617,9 +1635,7 @@ class FreqtradeBot(LoggingMixin):
                         f"Emergency exiting trade {trade}, as the exit order "
                         f"timed out {max_timeouts} times. force selling {order['amount']}."
                     )
-                    # Trade.session.refresh(order_obj)
-
-                    self.emergency_exit(trade, order["price"], order_obj.safe_remaining)
+                    self.emergency_exit(trade, order["price"], order["amount"])
             return canceled
 
     def emergency_exit(

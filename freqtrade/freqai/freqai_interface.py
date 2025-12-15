@@ -180,6 +180,14 @@ class IFreqaiModel(ABC):
         self.model = None
         self.dk = None
 
+    def _check_memory_before_training(self, pair: str, dk) -> bool:
+        """Check if we have enough memory for training"""
+        return True
+
+    def _estimate_training_memory(self, pair: str, dk) -> float:
+        """Estimate memory needed for training"""
+        return 0.0
+
     def _on_stop(self):
         """
         Callback for Subclasses to override to include logic for shutting down resources
